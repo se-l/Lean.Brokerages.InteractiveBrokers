@@ -52,6 +52,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public const string PeggedToMarket = "PEGMKT";
 
         /// <summary>
+        /// An order that is pegged to a stock NBBO multiplied by a user defined delta. For options.
+        /// Stocks
+        /// </summary>
+        public const string PeggedToStock = "PEG STK";
+
+        /// <summary>
         /// A Stop order becomes a market order to buy or sell securities or commodities once the specified stop price is attained or penetrated.
         /// Forex, Futures, Future Options, Options, Stocks, Warrants
         /// </summary>

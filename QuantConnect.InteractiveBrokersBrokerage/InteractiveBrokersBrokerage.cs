@@ -39,21 +39,14 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-//using QuantConnect.Api;
-//using RestSharp;
-//using System.IO;
-//using System.Net;
-//using System.Net.NetworkInformation;
-//using System.Security.Cryptography;
-//using System.Text;
 using Bar = QuantConnect.Data.Market.Bar;
 using HistoryRequest = QuantConnect.Data.HistoryRequest;
 using IB = QuantConnect.Brokerages.InteractiveBrokers.Client;
 using Order = QuantConnect.Orders.Order;
 using Newtonsoft.Json;
-//using Newtonsoft.Json.Linq;
 using QuantConnect.Data.Auxiliary;
 using System.Diagnostics;
+using Fasterflect;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
@@ -183,7 +176,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // exchange time zones by symbol
         private readonly Dictionary<Symbol, DateTimeZone> _symbolExchangeTimeZones = new Dictionary<Symbol, DateTimeZone>();
 
-        // IB requests made through the IB-API must be limited to a maximum of 50 messages/3 second
+        // IB requests made through the IB-API must be limited to a maximum of 50 messages/3 second. IBKR Campus "TWS API has a pacing limitation of 50 messages per second. As such, a total of 50 messages may be sent AND received within each one second span"
         private readonly RateGate _messagingRateLimiter = new RateGate(50, TimeSpan.FromSeconds(3));
 
         // See https://interactivebrokers.github.io/tws-api/historical_limitations.html
@@ -203,6 +196,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private readonly bool _enableDelayedStreamingData = Config.GetBool("ib-enable-delayed-streaming-data");
 
+        private readonly HashSet<string> _accountValueMarginKeys = new() { AccountValueKeys.EquityWithLoanValue, AccountValueKeys.ExcessLiquidity, AccountValueKeys.FullAvailableFunds, AccountValueKeys.FullInitMarginReq, AccountValueKeys.FullMaintMarginReq, AccountValueKeys.Leverage };
+
         // The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)
         private TimeSpan _weeklyRestartUtcTime;
         private DateTime _lastIBAutomaterExitTime;
@@ -216,6 +211,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _historyDelistedAssetWarning;
         private bool _historyExpiredAssetWarning;
         private bool _historyOpenInterestWarning;
+        private readonly HashSet<int> _possibleOcaTypes = new() { 1, 2, 3 };
 
         /// <summary>
         /// Returns true if we're currently connected to the broker
@@ -360,8 +356,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.PlaceOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity}. Id: {order.Id}");
-
                 if (!IsConnected)
                 {
                     OnMessage(
@@ -391,7 +385,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value} Quantity: {order.Quantity} Status: {order.Status} Id: {order.Id}");
+                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, LeanId: {order.Id}");
 
                 if (!IsConnected)
                 {
@@ -425,7 +419,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace("InteractiveBrokersBrokerage.CancelOrder(): Symbol: " + order.Symbol.Value + " Quantity: " + order.Quantity);
+                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
 
                 if (!IsConnected)
                 {
@@ -453,7 +447,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!eventSlim.Wait(_responseTimeout))
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {orderId} lean id {order.Id}"));
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
                     }
                     else
                     {
@@ -465,7 +459,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             catch (Exception err)
             {
-                Log.Error("InteractiveBrokersBrokerage.CancelOrder(): OrderID: " + order.Id + " - " + err);
+                Log.Error("InteractiveBrokersBrokerage.CancelOrder(): OrderId: " + order.Id + " - " + err);
                 return false;
             }
             return true;
@@ -490,7 +484,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private List<Order> GetOpenOrdersInternal(bool all)
         {
-            var orders = new List<(IBApi.Order Order, Contract Contract)>();
+            var orders = new List<(IBApi.Order Order, Contract Contract, OrderState OrderState)>();
 
             var manualResetEvent = new ManualResetEvent(false);
 
@@ -507,8 +501,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         lastOrderId = args.OrderId;
                     }
 
-                    // keep the IB order and contract objects returned from RequestOpenOrders
-                    orders.Add((args.Order, args.Contract));
+                    // keep the IB order, contract objects and order state returned from RequestOpenOrders
+                    orders.Add((args.Order, args.Contract, args.OrderState));
                 }
                 catch (Exception e)
                 {
@@ -567,7 +561,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // convert results to Lean Orders outside the eventhandler to avoid nesting requests, as conversion may request
             // contract details
-            return orders.Select(orderContract => ConvertOrders(orderContract.Order, orderContract.Contract)).SelectMany(orders => orders).ToList();
+            return orders.Select(orderContract => ConvertOrders(orderContract.Order, orderContract.Contract, orderContract.OrderState)).SelectMany(orders => orders).ToList();
         }
 
         /// <summary>
@@ -1263,8 +1257,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _connectEvent.Set();
             };
 
-            ValidateSubscription();
-
             // initialize our heart beat thread
             RunHeartBeatThread();
 
@@ -1338,6 +1330,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ManualResetEventSlim eventSlim = _pendingOrderResponse[ibOrderId] = eventSlim = new ManualResetEventSlim(false);
 
                 var ibOrder = ConvertOrder(orders, contract, ibOrderId);
+                Log.Trace($"InteractiveBrokersBrokerage.IBPlaceOrder. Placing order OrderId: {ibOrder.OrderId}, LeanId: {order.Id}, contract: {contract}, ibOrder: {ibOrder}, OcaGroup/Type: {ibOrder.OcaGroup}/{ibOrder.OcaType}");
                 _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
 
                 var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
@@ -1838,6 +1831,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     OnAccountChanged(new AccountEvent(e.Currency, cashBalance));
                 }
 
+                // we want to capture if the user's margin requiremnt changes so we can reflect it in the algorithm
+                else if (_accountValueMarginKeys.Contains(e.Key) && e.Currency != "BASE")
+                {
+                    _accountData.MarginMetrics.SetPropertyValue(e.Key, decimal.Parse(e.Value, CultureInfo.InvariantCulture));
+                }
+                if (e.Key == AccountValueKeys.FullMaintMarginReq && e.Currency != "BASE")
+                {
+                    OnMaintenanceMarginChanged(_accountData.MarginMetrics);
+                }
+
                 // IB does not explicitly return the account base currency, but we can find out using exchange rates returned
                 if (e.Key == AccountValueKeys.ExchangeRate && e.Currency != "BASE" && e.Value.ToDecimal() == 1)
                 {
@@ -1915,6 +1918,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                 }
 
+                //Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: OrderId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
+
                 // fire the events
                 if (orderEvents.Count > 0)
                 {
@@ -1945,10 +1950,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 // the only changes we handle now are trail stop price updates
                 var order = orders[0];
-                if (order.Type != OrderType.TrailingStop)
-                {
-                    return;
-                }
+                //if (order.Type != OrderType.TrailingStop)
+                //{
+                //    return;
+                //}
 
                 if (!CheckIfConnected())
                 {
@@ -1956,11 +1961,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
 
                 var updatedStopPrice = e.Order.TrailStopPrice;
-                var trailingStopOrder = (TrailingStopOrder)order;
-                if ((double)trailingStopOrder.StopPrice != updatedStopPrice)
-                {
-                    OnOrderUpdated(new OrderUpdateEvent { OrderId = trailingStopOrder.Id, TrailingStopPrice = updatedStopPrice.SafeDecimalCast() });
-                }
+                //var trailingStopOrder = (TrailingStopOrder)order;
+                //if ((double)trailingStopOrder.StopPrice != updatedStopPrice)
+                //{
+                //    OnOrderUpdated(new OrderUpdateEvent { OrderId = trailingStopOrder.Id, TrailingStopPrice = updatedStopPrice.SafeDecimalCast() });
+                //}
             }
             catch (Exception err)
             {
@@ -2016,7 +2021,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     eventSlim.Set();
                 }
-
                 Log.Trace("InteractiveBrokersBrokerage.HandleExecutionDetails(): " + executionDetails);
 
                 if (!IsConnected)
@@ -2135,6 +2139,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         currentQuantityFilled *= -1;
                     }
                     order = new MarketOrder(mappedSymbol, currentQuantityFilled, DateTime.UtcNow, "Brokerage Liquidation");
+                    order.Exchange = executionDetails.Execution.Exchange;
                     // this event will add the order into the lean engine
                     OnNewBrokerageOrderNotification(new NewBrokerageOrderNotificationEventArgs(order));
                 }
@@ -2263,8 +2268,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     Status = status,
                     FillPrice = price,
-                    FillQuantity = fillQuantity
-                };
+                    FillQuantity = fillQuantity,
+                    Exchange = targetOrderExecutionDetails.Execution.Exchange
+            };
                 if (remainingQuantity != 0)
                 {
                     orderEvent.Message += " - " + remainingQuantity + " remaining";
@@ -2353,8 +2359,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             if (order.Type == OrderType.Limit ||
                 order.Type == OrderType.LimitIfTouched ||
                 order.Type == OrderType.StopMarket ||
-                order.Type == OrderType.StopLimit ||
-                order.Type == OrderType.TrailingStop)
+                order.Type == OrderType.StopLimit
+                //order.Type == OrderType.TrailingStop
+                )
             {
                 if (orderProperties != null)
                 {
@@ -2374,8 +2381,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Tif = ConvertTimeInForce(order),
                 Transmit = true,
                 Rule80A = _agentDescription,
-                OutsideRth = outsideRth
+                OutsideRth = outsideRth,
+                OcaGroup = order.OcaGroup
             };
+            if (_possibleOcaTypes.Contains(order.OcaType))
+            {
+                ibOrder.OcaType = order.OcaType;
+            }
 
             var gtdTimeInForce = order.TimeInForce as GoodTilDateTimeInForce;
             if (gtdTimeInForce != null)
@@ -2404,12 +2416,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var limitOrder = order as LimitOrder;
             var stopMarketOrder = order as StopMarketOrder;
             var stopLimitOrder = order as StopLimitOrder;
-            var trailingStopOrder = order as TrailingStopOrder;
+            //var trailingStopOrder = order as TrailingStopOrder;
             var limitIfTouchedOrder = order as LimitIfTouchedOrder;
             var comboLimitOrder = order as ComboLimitOrder;
             var comboLegLimitOrder = order as ComboLegLimitOrder;
             var comboMarketOrder = order as ComboMarketOrder;
-            if (comboLegLimitOrder != null)
+            var peggedToStockOrder = order as PeggedToStockOrder;
+
+            if (peggedToStockOrder != null)
+            {
+                ibOrder.Delta = (double)peggedToStockOrder.Delta;
+                ibOrder.StartingPrice = (double?)peggedToStockOrder.StartingPrice ?? double.MaxValue;
+                ibOrder.StockRefPrice = (double?)peggedToStockOrder.StockRefPrice ?? double.MaxValue;
+                ibOrder.StockRangeLower = (double?)peggedToStockOrder.UnderlyingRangeLow ?? double.MaxValue;
+                ibOrder.StockRangeUpper = (double?)peggedToStockOrder.UnderlyingRangeHigh ?? double.MaxValue;
+            }
+            else if (comboLegLimitOrder != null)
             {
                 // Combo per-leg prices are only supported for non-guaranteed smart combos with two legs
                 AddGuaranteedTag(ibOrder, true);
@@ -2431,18 +2453,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 ibOrder.LmtPrice = NormalizePriceToBrokerage(limitOrder.LimitPrice, contract, order.Symbol);
             }
             // check trailing stop before stop market because TrailingStopOrder inherits StopMarketOrder
-            else if (trailingStopOrder != null)
-            {
-                ibOrder.TrailStopPrice = NormalizePriceToBrokerage(trailingStopOrder.StopPrice, contract, order.Symbol);
-                if (trailingStopOrder.TrailingAsPercentage)
-                {
-                    ibOrder.TrailingPercent = (double)trailingStopOrder.TrailingAmount * 100;
-                }
-                else
-                {
-                    ibOrder.AuxPrice = NormalizePriceToBrokerage(trailingStopOrder.TrailingAmount, contract, order.Symbol);
-                }
-            }
+            //else if (trailingStopOrder != null)
+            //{
+            //    ibOrder.TrailStopPrice = NormalizePriceToBrokerage(trailingStopOrder.StopPrice, contract, order.Symbol);
+            //    if (trailingStopOrder.TrailingAsPercentage)
+            //    {
+            //        ibOrder.TrailingPercent = (double)trailingStopOrder.TrailingAmount * 100;
+            //    }
+            //    else
+            //    {
+            //        ibOrder.AuxPrice = NormalizePriceToBrokerage(trailingStopOrder.TrailingAmount, contract, order.Symbol);
+            //    }
+            //}
             else if (stopMarketOrder != null)
             {
                 ibOrder.AuxPrice = NormalizePriceToBrokerage(stopMarketOrder.StopPrice, contract, order.Symbol);
@@ -2499,16 +2521,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // not yet supported
             //ibOrder.ParentId =
-            //ibOrder.OcaGroup =
 
             return ibOrder;
         }
 
-        private List<Order> ConvertOrders(IBApi.Order ibOrder, Contract contract)
+        private static decimal? CastDouble(double value)
+        {
+            if (value == double.MaxValue || value == double.MinValue || double.IsNaN(value) || double.IsPositiveInfinity(value))
+            {
+                return null;
+            }
+            else
+            {
+                return (decimal)value;
+            }
+        }
+
+        private List<Order> ConvertOrders(IBApi.Order ibOrder, Contract contract, OrderState orderState)
         {
             var result = new List<Order>();
             var quantitySign = ConvertOrderDirection(ibOrder.Action) == OrderDirection.Sell ? -1 : 1;
             var quantity = Convert.ToInt32(ibOrder.TotalQuantity) * quantitySign;
+            string ocaGroup = ibOrder.OcaGroup;
+            int ocaType = ibOrder.OcaType;            
 
             if (contract.SecType == IB.SecurityType.Bag)
             {
@@ -2537,21 +2572,45 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         legLimitPrice = ibOrder.OrderComboLegs[i].Price;
                     }
-                    result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType,
-                        comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, 0, 0, contractDetails.Contract, group));
+                    result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType, comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, contractDetails.Contract, group, orderState, ocaGroup, ocaType));
                 }
+            }
+            else if (ibOrder.OrderType == IB.OrderType.PeggedToStock)
+            {
+                result.Add(ConvertPeggedToStockOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, quantity, (decimal)ibOrder.Delta, 
+                    CastDouble(ibOrder.StartingPrice), CastDouble(ibOrder.StockRefPrice), CastDouble(ibOrder.StockRangeLower), CastDouble(ibOrder.StockRangeUpper), contract, orderState, ocaGroup, ocaType));
             }
             else
             {
-                result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity,
-                    ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null));
+                result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity, ibOrder.LmtPrice, contract, null, orderState, ocaGroup, ocaType));
             }
 
             return result;
         }
 
-        private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
-            double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager)
+        private Order ConvertPeggedToStockOrder(string timeInForce, string goodTillDate, int ibOrderId, decimal quantity, decimal delta, decimal? startingPrice, decimal? stockReferencePrice, decimal? underlyingRangeLow, decimal? underlyingRangeHigh, Contract contract, OrderState orderState, string ocaGroup, int ocaType)
+        {
+            Order order;
+            var mappedSymbol = MapSymbol(contract);
+
+            order = new PeggedToStockOrder(mappedSymbol,
+                quantity,
+                0.5m,
+                startingPrice,
+                stockReferencePrice,
+                underlyingRangeLow,
+                underlyingRangeHigh,
+                new DateTime() // not sure how to get this data
+                );
+
+            order.BrokerId.Add(ibOrderId.ToStringInvariant());
+            order.Properties.TimeInForce = ConvertTimeInForce(timeInForce, goodTillDate);
+            order.Status = ConvertOrderStatus(orderState.Status);
+
+            return order;
+        }
+
+        private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity, double limitPrice, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState, string ocaGroup, int ocaType)
         {
             // this function is called by GetOpenOrders which is mainly used by the setup handler to
             // initialize algorithm state.  So the only time we'll be executing this code is when the account
@@ -2586,7 +2645,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     order = new LimitOrder(mappedSymbol,
                         quantity,
                         NormalizePriceToLean(limitPrice, mappedSymbol),
-                        new DateTime()
+                        new DateTime(),
+                        ocaGroup: ocaGroup,
+                        ocaType: ocaType
                         );
                     break;
 
@@ -2607,28 +2668,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         );
                     break;
 
-                case OrderType.TrailingStop:
-                    decimal trailingAmount;
-                    bool trailingAsPecentage;
-                    if (trailingPercentage != double.MaxValue)
-                    {
-                        trailingAmount = trailingPercentage.SafeDecimalCast() / 100m;
-                        trailingAsPecentage = true;
-                    }
-                    else
-                    {
-                        trailingAmount = NormalizePriceToLean(auxPrice, mappedSymbol);
-                        trailingAsPecentage = false;
-                    }
+                //case OrderType.TrailingStop:
+                //    decimal trailingAmount;
+                //    bool trailingAsPecentage;
+                //    if (trailingPercentage != double.MaxValue)
+                //    {
+                //        trailingAmount = trailingPercentage.SafeDecimalCast() / 100m;
+                //        trailingAsPecentage = true;
+                //    }
+                //    else
+                //    {
+                //        trailingAmount = NormalizePriceToLean(auxPrice, mappedSymbol);
+                //        trailingAsPecentage = false;
+                //    }
 
-                    order = new TrailingStopOrder(mappedSymbol,
-                        quantity,
-                        NormalizePriceToLean(trailingStopPrice, mappedSymbol),
-                        trailingAmount,
-                        trailingAsPecentage,
-                        new DateTime()
-                    );
-                    break;
+                //    order = new TrailingStopOrder(mappedSymbol,
+                //        quantity,
+                //        NormalizePriceToLean(trailingStopPrice, mappedSymbol),
+                //        trailingAmount,
+                //        trailingAsPecentage,
+                //        new DateTime()
+                //    );
+                //    break;
 
                 case OrderType.LimitIfTouched:
                     order = new LimitIfTouchedOrder(mappedSymbol,
@@ -2671,6 +2732,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             order.BrokerId.Add(ibOrderId.ToStringInvariant());
             order.Properties.TimeInForce = ConvertTimeInForce(timeInForce, goodTillDate);
+            order.Status = ConvertOrderStatus(orderState.Status);
+
+            Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: OrderId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
 
             return order;
         }
@@ -2837,13 +2901,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 case OrderType.Limit: return IB.OrderType.Limit;
                 case OrderType.StopMarket: return IB.OrderType.Stop;
                 case OrderType.StopLimit: return IB.OrderType.StopLimit;
-                case OrderType.TrailingStop: return IB.OrderType.TrailingStop;
+                //case OrderType.TrailingStop: return IB.OrderType.TrailingStop;
                 case OrderType.LimitIfTouched: return IB.OrderType.LimitIfTouched;
                 case OrderType.MarketOnOpen: return IB.OrderType.Market;
                 case OrderType.MarketOnClose: return IB.OrderType.MarketOnClose;
                 case OrderType.ComboLegLimit: return IB.OrderType.Limit;
                 case OrderType.ComboLimit: return IB.OrderType.Limit;
                 case OrderType.ComboMarket: return IB.OrderType.Market;
+                case OrderType.PeggedToStock: return IB.OrderType.PeggedToStock;
                 default:
                     throw new InvalidEnumArgumentException(nameof(type), (int)type, typeof(OrderType));
             }
@@ -2859,9 +2924,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 case IB.OrderType.Limit: return OrderType.Limit;
                 case IB.OrderType.Stop: return OrderType.StopMarket;
                 case IB.OrderType.StopLimit: return OrderType.StopLimit;
-                case IB.OrderType.TrailingStop: return OrderType.TrailingStop;
+                //case IB.OrderType.TrailingStop: return OrderType.TrailingStop;
                 case IB.OrderType.LimitIfTouched: return OrderType.LimitIfTouched;
                 case IB.OrderType.MarketOnClose: return OrderType.MarketOnClose;
+                case IB.OrderType.PeggedToStock: return OrderType.PeggedToStock;
 
                 case IB.OrderType.Market:
                     if (order.Tif == IB.TimeInForce.MarketOnOpen)
@@ -4279,8 +4345,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             if (!_messagingRateLimiter.WaitToProceed(TimeSpan.Zero))
             {
-                Log.Trace("The IB API request has been rate limited.");
-
+                Log.Error($"CheckRateLimiting(): The IB API request has been rate limited. StackTrace: {Environment.StackTrace}");
                 _messagingRateLimiter.WaitToProceed();
             }
         }
@@ -4685,140 +4750,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             public string OrganizationId;
         }
 
-        /// <summary>
-        /// Validate the user of this project has permission to be using it via our web API.
-        /// </summary>
-        private static void ValidateSubscription()
-        {
-            //try
-            //{
-            //    var productId = 181;
-            //    var userId = Config.GetInt("job-user-id");
-            //    var token = Config.Get("api-access-token");
-            //    var organizationId = Config.Get("job-organization-id", null);
-            //    // Verify we can authenticate with this user and token
-            //    var api = new ApiConnection(userId, token);
-            //    if (!api.Connected)
-            //    {
-            //        throw new ArgumentException("Invalid api user id or token, cannot authenticate subscription.");
-            //    }
-            //    // Compile the information we want to send when validating
-            //    var information = new Dictionary<string, object>()
-            //    {
-            //        {"productId", productId},
-            //        {"machineName", Environment.MachineName},
-            //        {"userName", Environment.UserName},
-            //        {"domainName", Environment.UserDomainName},
-            //        {"os", Environment.OSVersion}
-            //    };
-            //    // IP and Mac Address Information
-            //    try
-            //    {
-            //        var interfaceDictionary = new List<Dictionary<string, object>>();
-            //        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces().Where(nic => nic.OperationalStatus == OperationalStatus.Up))
-            //        {
-            //            var interfaceInformation = new Dictionary<string, object>();
-            //            // Get UnicastAddresses
-            //            var addresses = nic.GetIPProperties().UnicastAddresses
-            //                .Select(uniAddress => uniAddress.Address)
-            //                .Where(address => !IPAddress.IsLoopback(address)).Select(x => x.ToString());
-            //            // If this interface has non-loopback addresses, we will include it
-            //            if (!addresses.IsNullOrEmpty())
-            //            {
-            //                interfaceInformation.Add("unicastAddresses", addresses);
-            //                // Get MAC address
-            //                interfaceInformation.Add("MAC", nic.GetPhysicalAddress().ToString());
-            //                // Add Interface name
-            //                interfaceInformation.Add("name", nic.Name);
-            //                // Add these to our dictionary
-            //                interfaceDictionary.Add(interfaceInformation);
-            //            }
-            //        }
-            //        information.Add("networkInterfaces", interfaceDictionary);
-            //    }
-            //    catch (Exception)
-            //    {
-            //        // NOP, not necessary to crash if fails to extract and add this information
-            //    }
-            //    // Include our OrganizationId is specified
-            //    if (!string.IsNullOrEmpty(organizationId))
-            //    {
-            //        information.Add("organizationId", organizationId);
-            //    }
-            //    var request = new RestRequest("modules/license/read", Method.POST) { RequestFormat = DataFormat.Json };
-            //    request.AddParameter("application/json", JsonConvert.SerializeObject(information), ParameterType.RequestBody);
-            //    api.TryRequest(request, out ModulesReadLicenseRead result);
-            //    if (!result.Success)
-            //    {
-            //        throw new InvalidOperationException($"Request for subscriptions from web failed, Response Errors : {string.Join(',', result.Errors)}");
-            //    }
-
-            //    var encryptedData = result.License;
-            //    // Decrypt the data we received
-            //    DateTime? expirationDate = null;
-            //    long? stamp = null;
-            //    bool? isValid = null;
-            //    if (encryptedData != null)
-            //    {
-            //        // Fetch the org id from the response if we are null, we need it to generate our validation key
-            //        if (string.IsNullOrEmpty(organizationId))
-            //        {
-            //            organizationId = result.OrganizationId;
-            //        }
-            //        // Create our combination key
-            //        var password = $"{token}-{organizationId}";
-            //        var key = SHA256.HashData(Encoding.UTF8.GetBytes(password));
-            //        // Split the data
-            //        var info = encryptedData.Split("::");
-            //        var buffer = Convert.FromBase64String(info[0]);
-            //        var iv = Convert.FromBase64String(info[1]);
-            //        // Decrypt our information
-            //        using var aes = new AesManaged();
-            //        var decryptor = aes.CreateDecryptor(key, iv);
-            //        using var memoryStream = new MemoryStream(buffer);
-            //        using var cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
-            //        using var streamReader = new StreamReader(cryptoStream);
-            //        var decryptedData = streamReader.ReadToEnd();
-            //        if (!decryptedData.IsNullOrEmpty())
-            //        {
-            //            var jsonInfo = JsonConvert.DeserializeObject<JObject>(decryptedData);
-            //            expirationDate = jsonInfo["expiration"]?.Value<DateTime>();
-            //            isValid = jsonInfo["isValid"]?.Value<bool>();
-            //            stamp = jsonInfo["stamped"]?.Value<int>();
-            //        }
-            //    }
-            //    // Validate our conditions
-            //    if (!expirationDate.HasValue || !isValid.HasValue || !stamp.HasValue)
-            //    {
-            //        throw new InvalidOperationException("Failed to validate subscription.");
-            //    }
-
-            //    var nowUtc = DateTime.UtcNow;
-            //    var timeSpan = nowUtc - Time.UnixTimeStampToDateTime(stamp.Value);
-            //    if (timeSpan > TimeSpan.FromHours(12))
-            //    {
-            //        throw new InvalidOperationException("Invalid API response.");
-            //    }
-            //    if (!isValid.Value)
-            //    {
-            //        throw new ArgumentException($"Your subscription is not valid, please check your product subscriptions on our website.");
-            //    }
-            //    if (expirationDate < nowUtc)
-            //    {
-            //        throw new ArgumentException($"Your subscription expired {expirationDate}, please renew in order to use this product.");
-            //    }
-            //}
-            //catch (Exception e)
-            //{
-            //    Log.Error($"ValidateSubscription(): Failed during validation, shutting down. Error : {e.Message}");
-            //    Environment.Exit(1);
-            //}
-        }
-
         private static class AccountValueKeys
         {
             public const string CashBalance = "CashBalance";
             public const string ExchangeRate = "ExchangeRate";
+            public const string EquityWithLoanValue = "EquityWithLoanValue";
+            public const string ExcessLiquidity = "ExcessLiquidity";
+            public const string FullAvailableFunds = "FullAvailableFunds";
+            public const string FullInitMarginReq = "FullInitMarginReq";
+            public const string FullMaintMarginReq = "FullMaintMarginReq";
+            public const string Leverage = "Leverage";
         }
 
         // these are fatal errors from IB
@@ -4830,13 +4771,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // these are warning messages from IB
         private static readonly HashSet<int> WarningCodes = new HashSet<int>
         {
-            102, 104, 105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 201, 303,312,313,314,315,319,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400,402,403,404,405,406,407,408,409,410,411,412,413,417,418,419,420,421,422,423,424,425,426,427,428,429,430,433,434,435,436,437,439,440,441,442,443,444,445,446,447,448,449,450,10002,10003,10006,10007,10008,10009,10010,10011,10012,10014,10018,10019,10020,10052,10147,10148,10149,2100,2101,2102,2109,2148
+            102, 104, 105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 201, 303,312,313,314,315,319,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400,402,403,404,405,406,407,408,409,410,411,412,413,417,418,419,420,421,422,423,424,425,426,427,428,429,430,433,434,435,436,437,439,440,441,442,443,444,445,446,447,448,449,450,10002,10003,10006,10007,10008,10009,10010,10011,10012,10014,10018,10019,10020,10052,10147,10148,10149,2100,2101,2102,2109,2148,
         };
 
         // these require us to issue invalidated order events
         private static readonly HashSet<int> InvalidatingCodes = new HashSet<int>
         {
+            103, // Order not accepted. Loan to Value ratio exceeeds margin.
             104, // Can't modify a filled order
+            10327, // OCA group type revision is not allowed.
             10148, // OrderId <OrderId> that needs to be cancelled can not be cancelled, state:
             105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 147, 148, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 163, 167, 168, 201,312,313,314,315,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,387,388,389,390,391,392,393,394,395,396,397,398,400,401,402,403,405,406,407,408,409,410,411,412,413,417,418,419,421,423,424,427,428,429,433,434,435,436,437,439,440,441,442,443,444,445,446,447,448,449,463,10002,10006,10007,10008,10009,10010,10011,10012,10014,10020,10058,2102
         };

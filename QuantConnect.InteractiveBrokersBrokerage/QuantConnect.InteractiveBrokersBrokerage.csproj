@@ -13,8 +13,13 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <Description>QuantConnect LEAN InteractiveBrokers Brokerage: Brokerage Template plugin for Lean</Description>
+    <Configurations>Debug;Release;Debug2</Configurations>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugType>full</DebugType>
+    <OutputPath>bin\Debug\</OutputPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug2|AnyCPU'">
     <DebugType>full</DebugType>
     <OutputPath>bin\Debug\</OutputPath>
   </PropertyGroup>
@@ -44,6 +49,7 @@
 	<None Include="InteractiveBrokers\IB-symbol-map.json" Pack="True">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 	</None>
+	<ProjectReference Include="..\..\Lean\Brokerages\QuantConnect.Brokerages.csproj" />
 	<Reference Include="CSharpAPI">
 		<HintPath>CSharpAPI.dll</HintPath>
 	</Reference>

@@ -15,6 +15,7 @@
 
 using System.Collections.Concurrent;
 using QuantConnect.Brokerages.InteractiveBrokers.FinancialAdvisor;
+using QuantConnect.Securities;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
@@ -44,6 +45,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public FinancialAdvisorConfiguration FinancialAdvisorConfiguration { get; } = new FinancialAdvisorConfiguration();
 
         /// <summary>
+        /// Margin
+        /// </summary>
+        public MarginMetrics MarginMetrics { get; internal set; } = new MarginMetrics();
+
+        /// <summary>
         /// Clears this instance of <see cref="InteractiveBrokersAccountData"/>
         /// </summary>
         public void Clear()
@@ -52,6 +58,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             CashBalances.Clear();
             AccountHoldings.Clear();
             FinancialAdvisorConfiguration.Clear();
+            MarginMetrics.Clear();
         }
     }
 }
