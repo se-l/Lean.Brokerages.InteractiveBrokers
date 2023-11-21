@@ -60,6 +60,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// During market open there can be some extra delay and resource constraint so let's be generous
         /// </summary>
         private static readonly TimeSpan _responseTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60 * 5));
+        //private static readonly TimeSpan _responsePlaceOrderTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60 * 15));
 
         /// <summary>
         /// Some orders might not send a submission event back to us, in which case we create a submission event ourselves
@@ -447,7 +448,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!eventSlim.Wait(_responseTimeout))
                     {
+                        //eventSlim.DisposeSafely();
                         OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
+                        //CancelOrder(order);                        
                     }
                     else
                     {
@@ -1360,7 +1363,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     else
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"Timeout waiting for brokerage response for brokerage order id {ibOrderId} lean id {order.Id}"));
+                        //eventSlim.DisposeSafely();
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId {order.Id}. Canceling"));
+                        //CancelOrder(order);
                     }
                 }
                 else
@@ -1749,6 +1754,31 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         Status = OrderStatus.Invalid,
                         Message = message
                     }).ToList());
+
+                    HashSet<string> ocoGroups = new();
+                    foreach (var order in orders)
+                    {
+                        if (!order.OcaGroup.IsNullOrEmpty())
+                        {
+                            ocoGroups.Add(order.OcaGroup);
+                        }
+                    }
+                    if (ocoGroups.Any())
+                    {
+                        Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): Canceling all related OCO as it triggered a timeout - to be reviewed.");
+                        foreach (var ocoGroup in ocoGroups)
+                        {
+                            foreach (var order in _orderProvider.GetOpenOrders())
+                            {
+                                if (order.OcaGroup == ocoGroup)
+                                {
+                                    CancelOrder(order);
+                                }
+                            }
+                        }
+                    }
+                    
+
                 }
             }
 
