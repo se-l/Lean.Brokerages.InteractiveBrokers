@@ -132,6 +132,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         // tracks pending brokerage order responses. In some cases we've seen orders been placed and they never get through to IB
         private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingOrderResponse = new();
+        private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingRetryPlaceOrderAttempts = new();
+        private readonly ConcurrentDictionary<int, ManualResetEventSlim> _pendingRetryCancelOrderAttempts = new();
 
         // tracks the pending orders in the group before emitting the fill events
         private readonly Dictionary<int, List<PendingFillEvent>> _pendingGroupOrdersForFilling = new();
@@ -420,7 +422,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
+                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): OrderId: {order.BrokerId}, LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
 
                 if (!IsConnected)
                 {
@@ -441,16 +443,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     CheckRateLimiting();
 
+                    if (_pendingOrderResponse.TryRemove(orderId, out var pendingEventSlim))
+                    {
+                        Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): Setting Existing EventSlim. OrderId: {orderId} LeanId: {order.Id} pendingEventSlim: {pendingEventSlim} Disposing.");
+                        pendingEventSlim.Set();
+                    }
+
                     var eventSlim = new ManualResetEventSlim(false);
                     _pendingOrderResponse[orderId] = eventSlim;
 
                     _client.ClientSocket.cancelOrder(orderId, string.Empty);
 
+
+
                     if (!eventSlim.Wait(_responseTimeout))
                     {
-                        //eventSlim.DisposeSafely();
                         OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
-                        //CancelOrder(order);                        
                     }
                     else
                     {
@@ -1334,6 +1342,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 var ibOrder = ConvertOrder(orders, contract, ibOrderId);
                 Log.Trace($"InteractiveBrokersBrokerage.IBPlaceOrder. Placing order OrderId: {ibOrder.OrderId}, LeanId: {order.Id}, contract: {contract}, ibOrder: {ibOrder}, OcaGroup/Type: {ibOrder.OcaGroup}/{ibOrder.OcaType}");
+
                 _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
 
                 var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
@@ -1363,9 +1372,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     else
                     {
-                        //eventSlim.DisposeSafely();
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId {order.Id}. Canceling"));
-                        //CancelOrder(order);
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId {order.Id}."));
                     }
                 }
                 else
