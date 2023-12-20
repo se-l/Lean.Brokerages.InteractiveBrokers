@@ -59,8 +59,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// During market open there can be some extra delay and resource constraint so let's be generous
         /// </summary>
-        private static readonly TimeSpan _responseTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60 * 5));
-        //private static readonly TimeSpan _responsePlaceOrderTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60 * 15));
+        private static readonly TimeSpan _responseTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60));
+        private static readonly TimeSpan _responsePlaceOrderTimeout = TimeSpan.FromSeconds(Config.GetInt("ib-response-timeout", 60));
 
         /// <summary>
         /// Some orders might not send a submission event back to us, in which case we create a submission event ourselves
@@ -388,7 +388,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, LeanId: {order.Id}");
+                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, OrderId: {order.BrokerId}, LeanId: {order.Id}");
 
                 if (!IsConnected)
                 {
@@ -458,7 +458,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (!eventSlim.Wait(_responseTimeout))
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
+                        eventSlim.DisposeSafely();
+                        GetOpenOrdersInternal(false);
                     }
                     else
                     {
@@ -1346,7 +1348,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
 
                 var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
-                if (!eventSlim.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responseTimeout))
+                if (!eventSlim.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responsePlaceOrderTimeout))
                 {
                     if(noSubmissionOrderTypes)
                     {
@@ -1372,7 +1374,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                     else
                     {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId {order.Id}."));
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId: {order.Id}."));
+                        eventSlim.DisposeSafely();
+                        GetOpenOrdersInternal(false);
                     }
                 }
                 else
@@ -1762,22 +1766,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         Message = message
                     }).ToList());
 
-                    HashSet<string> ocoGroups = new();
+                    HashSet<string> ocaGroups = new();
                     foreach (var order in orders)
                     {
                         if (!order.OcaGroup.IsNullOrEmpty())
                         {
-                            ocoGroups.Add(order.OcaGroup);
+                            ocaGroups.Add(order.OcaGroup);
                         }
                     }
-                    if (ocoGroups.Any())
+                    Log.Trace($"OCA Groups associated with invalid order: {string.Join(",", ocaGroups)}");
+                    if (ocaGroups.Any())
                     {
-                        Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): Canceling all related OCO as it triggered a timeout - to be reviewed.");
-                        foreach (var ocoGroup in ocoGroups)
+                        Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): Canceling all related OCO as it migh trigger a timeout - to be reviewed.");
+                        foreach (var ocaGroup in ocaGroups)
                         {
                             foreach (var order in _orderProvider.GetOpenOrders())
                             {
-                                if (order.OcaGroup == ocoGroup)
+                                if (order.OcaGroup == ocaGroup)
                                 {
                                     CancelOrder(order);
                                 }
@@ -4808,7 +4813,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // these are warning messages from IB
         private static readonly HashSet<int> WarningCodes = new HashSet<int>
         {
-            102, 104, 105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 201, 303,312,313,314,315,319,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400,402,403,404,405,406,407,408,409,410,411,412,413,417,418,419,420,421,422,423,424,425,426,427,428,429,430,433,434,435,436,437,439,440,441,442,443,444,445,446,447,448,449,450,10002,10003,10006,10007,10008,10009,10010,10011,10012,10014,10018,10019,10020,10052,10147,10148,10149,2100,2101,2102,2109,2148,
+            102, 104, 105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 201, 303,312,313,314,315,319,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400,402,403,404,405,406,407,408,409,410,411,412,413,417,418,419,420,421,422,423,424,425,426,427,428,429,430,433,435,436,437,439,440,441,442,443,444,445,446,447,448,449,450,10002,10003,10006,10007,10008,10009,10010,10011,10012,10014,10018,10019,10020,10052,10147,10148,10149,2100,2101,2102,2109,2148,
         };
 
         // these require us to issue invalidated order events
@@ -4816,6 +4821,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             103, // Order not accepted. Loan to Value ratio exceeeds margin.
             104, // Can't modify a filled order
+            434, // The order size cannot be zero.
             10327, // OCA group type revision is not allowed.
             10148, // OrderId <OrderId> that needs to be cancelled can not be cancelled, state:
             105, 106, 107, 109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 140, 141, 146, 147, 148, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 163, 167, 168, 201,312,313,314,315,325,328,329,334,335,336,337,338,339,340,341,342,343,345,347,348,349,350,352,353,355,356,358,359,360,361,362,363,364,367,368,369,370,371,372,373,374,375,376,377,378,379,380,382,383,387,388,389,390,391,392,393,394,395,396,397,398,400,401,402,403,405,406,407,408,409,410,411,412,413,417,418,419,421,423,424,427,428,429,433,434,435,436,437,439,440,441,442,443,444,445,446,447,448,449,463,10002,10006,10007,10008,10009,10010,10011,10012,10014,10020,10058,2102
