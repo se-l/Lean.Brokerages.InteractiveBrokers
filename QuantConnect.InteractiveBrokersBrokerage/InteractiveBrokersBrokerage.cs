@@ -388,7 +388,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, OrderId: {order.BrokerId}, LeanId: {order.Id}");
+                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, BrokerId: {order.BrokerId}, LeanId: {order.Id}");
 
                 if (!IsConnected)
                 {
@@ -422,7 +422,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): OrderId: {order.BrokerId}, LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
+                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): BrokerId: {order.BrokerId}, LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
 
                 if (!IsConnected)
                 {
@@ -445,34 +445,33 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     if (_pendingOrderResponse.TryRemove(orderId, out var pendingEventSlim))
                     {
-                        Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): Setting Existing EventSlim. OrderId: {orderId} LeanId: {order.Id} pendingEventSlim: {pendingEventSlim} Disposing.");
+                        Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): Setting Existing EventSlim. BrokerId: {orderId} LeanId: {order.Id} pendingEventSlim: {pendingEventSlim} Disposing.");
                         pendingEventSlim.Set();
                     }
 
                     var eventSlim = new ManualResetEventSlim(false);
-                    _pendingOrderResponse[orderId] = eventSlim;
+                    // _pendingOrderResponse[orderId] = eventSlim;
 
                     _client.ClientSocket.cancelOrder(orderId, string.Empty);
 
-
-
-                    if (!eventSlim.Wait(_responseTimeout))
-                    {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage OrderId: {orderId} LeanId: {order.Id}"));
-                        eventSlim.DisposeSafely();
-                        GetOpenOrdersInternal(false);
-                    }
-                    else
-                    {
-                        eventSlim.DisposeSafely();
-                    }
+                    // Blocks the entire transaction manager until the order is cancelled
+                    //if (!eventSlim.Wait(_responseTimeout))
+                    //{
+                    //    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"CancelOrder: Timeout waiting for brokerage response for brokerage BrokerId: {orderId} LeanId: {order.Id}"));
+                    //    eventSlim.DisposeSafely();
+                    //    GetOpenOrdersInternal(false);
+                    //}
+                    //else
+                    //{
+                    //    eventSlim.DisposeSafely();
+                    //}
                 }
 
                 // canceled order events fired upon confirmation, see HandleError
             }
             catch (Exception err)
             {
-                Log.Error("InteractiveBrokersBrokerage.CancelOrder(): OrderId: " + order.Id + " - " + err);
+                Log.Error("InteractiveBrokersBrokerage.CancelOrder(): BrokerId: " + order.Id + " - " + err);
                 return false;
             }
             return true;
@@ -1128,24 +1127,26 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
         public static bool IsIbGatewayRunning()
         {
+            bool gatewayIsRunning = Environment.GetEnvironmentVariable("gateway-is-running") == "true";  // If process is started in docker, just pass as env variable.
             var processes = Process.GetProcessesByName("ibgateway");
             var isRunning = processes.Length > 0;
-            if (isRunning)
+            if (isRunning || gatewayIsRunning)
             {
                 Log.Trace("InteractiveBrokersBrokerage.IsIbGatewayRunning(): IB Gateway is running.");
             }
-            return isRunning;
+            return isRunning || gatewayIsRunning;
         }
 
         public static bool IsTWSRunning()
         {
+            bool twsIsRunning = Environment.GetEnvironmentVariable("tws-is-running") == "true";  // If process is started in docker, just pass as env variable.
             var processes = Process.GetProcessesByName("tws");
             var isRunning = processes.Length > 0;
-            if (isRunning)
+            if (isRunning || twsIsRunning)
             {
                 Log.Trace("InteractiveBrokersBrokerage.IsTWSRunning(): TWS is running.");
             }
-            return isRunning;
+            return isRunning || twsIsRunning;
         }
 
         /// <summary>
@@ -1340,49 +1341,50 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
             else
             {
-                ManualResetEventSlim eventSlim = _pendingOrderResponse[ibOrderId] = eventSlim = new ManualResetEventSlim(false);
+                // ManualResetEventSlim eventSlim = _pendingOrderResponse[ibOrderId] = eventSlim = new ManualResetEventSlim(false);
 
                 var ibOrder = ConvertOrder(orders, contract, ibOrderId);
-                Log.Trace($"InteractiveBrokersBrokerage.IBPlaceOrder. Placing order OrderId: {ibOrder.OrderId}, LeanId: {order.Id}, contract: {contract}, ibOrder: {ibOrder}, OcaGroup/Type: {ibOrder.OcaGroup}/{ibOrder.OcaType}");
+                Log.Trace($"InteractiveBrokersBrokerage.IBPlaceOrder. Placing order BrokerId: {ibOrder.OrderId}, LeanId: {order.Id}, contract: {contract}, ibOrder: {ibOrder}, OcaGroup/Type: {ibOrder.OcaGroup}/{ibOrder.OcaType}");
 
                 _client.ClientSocket.placeOrder(ibOrder.OrderId, contract, ibOrder);
 
-                var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
-                if (!eventSlim.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responsePlaceOrderTimeout))
-                {
-                    if(noSubmissionOrderTypes)
-                    {
-                        if(!_submissionOrdersWarningSent)
-                        {
-                            _submissionOrdersWarningSent = true;
-                            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning,
-                                "OrderSubmissionWarning",
-                                "Interactive Brokers does not send a submission event for some order types, in these cases if no error is detected Lean will generate the submission event."));
-                        }
+                // This is blocking the entire TransactionManager Thread and all subsequent order requests. Prevents timely hedging every day. 
+                //var noSubmissionOrderTypes = _noSubmissionOrderTypes.Contains(order.Type);
+                //if (!eventSlim.Wait(noSubmissionOrderTypes ? _noSubmissionOrdersResponseTimeout : _responsePlaceOrderTimeout))
+                //{
+                //    if(noSubmissionOrderTypes)
+                //    {
+                //        if(!_submissionOrdersWarningSent)
+                //        {
+                //            _submissionOrdersWarningSent = true;
+                //            OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning,
+                //                "OrderSubmissionWarning",
+                //                "Interactive Brokers does not send a submission event for some order types, in these cases if no error is detected Lean will generate the submission event."));
+                //        }
 
-                        if (_pendingOrderResponse.TryRemove(ibOrderId, out var _))
-                        {
-                            eventSlim.DisposeSafely();
+                //        if (_pendingOrderResponse.TryRemove(ibOrderId, out var _))
+                //        {
+                //            eventSlim.DisposeSafely();
 
-                            var orderEvents = orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
-                            {
-                                Status = OrderStatus.Submitted,
-                                Message = "Lean Generated Interactive Brokers Order Event"
-                            }).ToList();
-                            OnOrderEvents(orderEvents);
-                        }
-                    }
-                    else
-                    {
-                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId: {order.Id}."));
-                        eventSlim.DisposeSafely();
-                        GetOpenOrdersInternal(false);
-                    }
-                }
-                else
-                {
-                    eventSlim.DisposeSafely();
-                }
+                //            var orderEvents = orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
+                //            {
+                //                Status = OrderStatus.Submitted,
+                //                Message = "Lean Generated Interactive Brokers Order Event"
+                //            }).ToList();
+                //            OnOrderEvents(orderEvents);
+                //        }
+                //    }
+                //    else
+                //    {
+                //        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "NoBrokerageResponse", $"IBPlaceOrder: Timeout waiting for brokerage response for brokerage BrokerId: {ibOrderId} LeanId: {order.Id}."));
+                //        eventSlim.DisposeSafely();
+                //        GetOpenOrdersInternal(false);
+                //    }
+                //}
+                //else
+                //{
+                //    eventSlim.DisposeSafely();
+                //}
             }
         }
 
@@ -1750,7 +1752,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
 
                 var message = $"{errorCode} - {errorMsg}";
-                Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): IBOrderId: {requestId} ErrorCode: {message}");
+                Log.Trace($"InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): IBBrokerId: {requestId} ErrorCode: {message}");
 
                 // invalidate the order
                 var orders = _orderProvider.GetOrdersByBrokerageId(requestId);
@@ -1960,7 +1962,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     }
                 }
 
-                //Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: OrderId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
+                //Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: BrokerId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
 
                 // fire the events
                 if (orderEvents.Count > 0)
@@ -2776,7 +2778,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             order.Properties.TimeInForce = ConvertTimeInForce(timeInForce, goodTillDate);
             order.Status = ConvertOrderStatus(orderState.Status);
 
-            Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: OrderId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
+            Log.Trace($"InteractiveBrokersBrokerage.ConvertOrder(): OcaGroup/Type: BrokerId: {order.Id}, OcaGroup/Type {ocaGroup}/{ocaType}, Status: {order.Status}, Exchange: {contract.Exchange}, PrimaryExch: {contract.PrimaryExch}");
 
             return order;
         }
