@@ -2313,7 +2313,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     Status = status,
                     FillPrice = price,
                     FillQuantity = fillQuantity,
-                    Exchange = targetOrderExecutionDetails.Execution.Exchange
+                    Message = targetOrderExecutionDetails.Execution.Exchange
             };
                 if (remainingQuantity != 0)
                 {
@@ -2465,17 +2465,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var comboLimitOrder = order as ComboLimitOrder;
             var comboLegLimitOrder = order as ComboLegLimitOrder;
             var comboMarketOrder = order as ComboMarketOrder;
-            var peggedToStockOrder = order as PeggedToStockOrder;
 
-            if (peggedToStockOrder != null)
-            {
-                ibOrder.Delta = (double)peggedToStockOrder.Delta;
-                ibOrder.StartingPrice = (double?)peggedToStockOrder.StartingPrice ?? double.MaxValue;
-                ibOrder.StockRefPrice = (double?)peggedToStockOrder.StockRefPrice ?? double.MaxValue;
-                ibOrder.StockRangeLower = (double?)peggedToStockOrder.UnderlyingRangeLow ?? double.MaxValue;
-                ibOrder.StockRangeUpper = (double?)peggedToStockOrder.UnderlyingRangeHigh ?? double.MaxValue;
-            }
-            else if (comboLegLimitOrder != null)
+            if (comboLegLimitOrder != null)
             {
                 // Combo per-leg prices are only supported for non-guaranteed smart combos with two legs
                 AddGuaranteedTag(ibOrder, true);
@@ -2619,39 +2610,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType, comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, contractDetails.Contract, group, orderState, ocaGroup, ocaType));
                 }
             }
-            else if (ibOrder.OrderType == IB.OrderType.PeggedToStock)
-            {
-                result.Add(ConvertPeggedToStockOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, quantity, (decimal)ibOrder.Delta, 
-                    CastDouble(ibOrder.StartingPrice), CastDouble(ibOrder.StockRefPrice), CastDouble(ibOrder.StockRangeLower), CastDouble(ibOrder.StockRangeUpper), contract, orderState, ocaGroup, ocaType));
-            }
             else
             {
                 result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity, ibOrder.LmtPrice, contract, null, orderState, ocaGroup, ocaType));
             }
 
             return result;
-        }
-
-        private Order ConvertPeggedToStockOrder(string timeInForce, string goodTillDate, int ibOrderId, decimal quantity, decimal delta, decimal? startingPrice, decimal? stockReferencePrice, decimal? underlyingRangeLow, decimal? underlyingRangeHigh, Contract contract, OrderState orderState, string ocaGroup, int ocaType)
-        {
-            Order order;
-            var mappedSymbol = MapSymbol(contract);
-
-            order = new PeggedToStockOrder(mappedSymbol,
-                quantity,
-                0.5m,
-                startingPrice,
-                stockReferencePrice,
-                underlyingRangeLow,
-                underlyingRangeHigh,
-                new DateTime() // not sure how to get this data
-                );
-
-            order.BrokerId.Add(ibOrderId.ToStringInvariant());
-            order.Properties.TimeInForce = ConvertTimeInForce(timeInForce, goodTillDate);
-            order.Status = ConvertOrderStatus(orderState.Status);
-
-            return order;
         }
 
         private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity, double limitPrice, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState, string ocaGroup, int ocaType)
