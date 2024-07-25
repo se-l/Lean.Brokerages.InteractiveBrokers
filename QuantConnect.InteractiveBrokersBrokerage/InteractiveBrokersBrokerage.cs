@@ -90,7 +90,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private IBAutomater.IBAutomater _ibAutomater;
 
         // Existing orders created in TWS can *only* be cancelled/modified when connected with ClientId = 0
-        private const int ClientId = 0;
+        private int ClientId = Config.GetInt("ib-client-id", 0);
 
         // daily restart is at 23:45 local host time
         private static TimeSpan _heartBeatTimeLimit = new(23, 0, 0);
@@ -388,7 +388,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, BrokerId: {order.BrokerId}, LeanId: {order.Id}");
+                Log.Trace($"InteractiveBrokersBrokerage.UpdateOrder(): Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}, Status: {order.Status}, BrokerId: {string.Join(",", order.BrokerId)}, LeanId: {order.Id}");
 
                 if (!IsConnected)
                 {
@@ -422,7 +422,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
-                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): BrokerId: {order.BrokerId}, LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
+                Log.Trace($"InteractiveBrokersBrokerage.CancelOrder(): BrokerId: {string.Join(",", order.BrokerId)}, LeanId: {order.Id}, Symbol: {order.Symbol.Value}, Quantity: {order.Quantity}");
 
                 if (!IsConnected)
                 {
@@ -588,6 +588,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 Connect();
             }
 
+            return GetAccountHoldingsConnected();
+        }
+
+        public List<Holding> GetAccountHoldingsConnected()
+        {
             var utcNow = DateTime.UtcNow;
             var holdings = new List<Holding>();
 
@@ -1127,7 +1132,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
         public static bool IsIbGatewayRunning()
         {
-            bool gatewayIsRunning = Environment.GetEnvironmentVariable("gateway-is-running") == "true";  // If process is started in docker, just pass as env variable.
+            bool gatewayIsRunning = Config.GetValue<bool>("gateway-is-running");  // Config checks environment variable
             var processes = Process.GetProcessesByName("ibgateway");
             var isRunning = processes.Length > 0;
             if (isRunning || gatewayIsRunning)
@@ -1139,7 +1144,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         public static bool IsTWSRunning()
         {
-            bool twsIsRunning = Environment.GetEnvironmentVariable("tws-is-running") == "true";  // If process is started in docker, just pass as env variable.
+            if (Config.GetValue("ignore-tws", false)) return false;
+
+            bool twsIsRunning = Config.GetValue<bool>("tws-is-running");  // Config checks environment variable
             var processes = Process.GetProcessesByName("tws");
             var isRunning = processes.Length > 0;
             if (isRunning || twsIsRunning)
@@ -2352,6 +2359,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     var holding = CreateHolding(e);
                     _accountData.AccountHoldings[holding.Symbol.Value] = holding;
+                    OnAccountHoldingsChanged(GetAccountHoldingsConnected());
                 }
             }
             catch (Exception exception)
@@ -2936,6 +2944,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 case IB.OrderType.LimitIfTouched: return OrderType.LimitIfTouched;
                 case IB.OrderType.MarketOnClose: return OrderType.MarketOnClose;
                 case IB.OrderType.PeggedToStock: return OrderType.PeggedToStock;
+                case IB.OrderType.PeggedToPrimVol: return OrderType.PeggedToPrimVol;
 
                 case IB.OrderType.Market:
                     if (order.Tif == IB.TimeInForce.MarketOnOpen)
@@ -3432,6 +3441,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="symbols">The symbols to be added keyed by SecurityType</param>
         private bool Subscribe(IEnumerable<Symbol> symbols)
         {
+            if (symbols.Any(x => x.SecurityType != SecurityType.Equity))
+            {
+                return false;
+            }
+
             if (!CanHandleSubscriptionRequest(symbols, "subscribe"))
             {
                 return true;
@@ -3595,8 +3609,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return
                 (securityType == SecurityType.Equity && market == Market.USA) ||
                 (securityType == SecurityType.Forex && market == Market.Oanda) ||
-                (securityType == SecurityType.Option && market == Market.USA) ||
-                (securityType == SecurityType.IndexOption && market == Market.USA) ||
+                // My IB Data subscription does not support enough symbols
+                //(securityType == SecurityType.Option && market == Market.USA) ||
+                //(securityType == SecurityType.IndexOption && market == Market.USA) ||
                 (securityType == SecurityType.Index && market == Market.USA) ||
                 (securityType == SecurityType.FutureOption) ||
                 (securityType == SecurityType.Future);

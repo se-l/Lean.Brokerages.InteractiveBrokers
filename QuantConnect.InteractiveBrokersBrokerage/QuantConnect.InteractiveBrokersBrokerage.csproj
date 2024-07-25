@@ -35,7 +35,6 @@
   </ItemGroup>
 
   <ItemGroup>
-	  <PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />
 	  <PackageReference Include="QuantConnect.IBAutomater" Version="2.0.76">
 		<!--
             Content files of dependencies are excluded by default.
