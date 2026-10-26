@@ -1142,19 +1142,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             return isRunning || gatewayIsRunning;
         }
 
-        public static bool IsTWSRunning()
-        {
-            if (Config.GetValue("ignore-tws", false)) return false;
-
-            bool twsIsRunning = Config.GetValue<bool>("tws-is-running");  // Config checks environment variable
-            var processes = Process.GetProcessesByName("tws");
-            var isRunning = processes.Length > 0;
-            if (isRunning || twsIsRunning)
-            {
-                Log.Trace("InteractiveBrokersBrokerage.IsTWSRunning(): TWS is running.");
-            }
-            return isRunning || twsIsRunning;
-        }
+        public static bool UseTWS() => Config.GetValue("use-tws", false);
 
         /// <summary>
         /// Initialize the instance of this class
@@ -1224,7 +1212,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _ibAutomater.Exited += OnIbAutomaterExited;
             _ibAutomater.Restarted += OnIbAutomaterRestarted;
 
-            if (!(IsIbGatewayRunning() || IsTWSRunning()))
+            if (!(IsIbGatewayRunning() || UseTWS()))
             {
                 CheckIbAutomaterError(_ibAutomater.Start(false));
             }
@@ -4583,7 +4571,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         Log.Trace("InteractiveBrokersBrokerage.OnIbAutomaterExited(): restarting...");
 
-                        if (!(IsIbGatewayRunning() || IsTWSRunning()))
+                        if (!(IsIbGatewayRunning() || UseTWS()))
                         {
                             CheckIbAutomaterError(_ibAutomater.Start(false));
                         }
