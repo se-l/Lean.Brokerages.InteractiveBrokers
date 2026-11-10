@@ -4776,7 +4776,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // these are fatal errors from IB
         private static readonly HashSet<int> ErrorCodes = new HashSet<int>
         {
-            100, 101, 103, 138, 139, 142, 143, 144, 145, 200, 203, 300,301,302,306,308,309,310,311,316,317,320,321,322,323,324,326,327,330,331,332,333,344,346,354,357,365,366,381,384,401,414,431,432,438,501,502,503,504,505,506,507,508,510,511,512,513,514,515,516,517,518,519,520,521,522,523,524,525,526,527,528,529,530,531,10000,10001,10005,10013,10015,10016,10021,10022,10023,10024,10025,10026,10027,1300
+            100, 101, 103, 138, 139, 142, 143, 144, 145, 200, 203, 300,301,302,306,308,309,310,311,316,317,320,321,322,323,324,326,327,330,331,332,333,344,346,354,357,365,366,381,384,401,414,431,432,438,501,502,503,504,505,506,507,508,510,511,512,513,514,515,516,517,518,519,520,521,522,523,524,525,526,527,528,529,530,10000,10001,10005,10013,10015,10016,10021,10022,10023,10024,10025,10026,10027,1300
         };
 
         // these are warning messages from IB
@@ -4801,6 +4801,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             // 'Request Account Data Sending Error' can happen while connecting sometimes let's ignore it else it bubbles up to the user even if we connected successfully later
             542,
+            // 531 'Request Current Time Sending Error' is the heartbeat's clock request (reqCurrentTime in
+            // HeartBeat()), never a trading operation: it only says the gateway could not answer that one
+            // request. Classified as a fatal error it went DefaultBrokerageMessageHandler -> SetRuntimeError
+            // and stopped every algorithm on the gateway at once (three live traders, 2026-11-09 18:09:06).
+            // HeartBeat() already logs the failed beat, retries with a longer wait and only then
+            // disconnects/reconnects, while a real outage still arrives as 1100/2103/2105.
+            531,
             10148, // we are going to handle it as an order event
             1100, 1101, 1102, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2157, 2158, 10197
         };
