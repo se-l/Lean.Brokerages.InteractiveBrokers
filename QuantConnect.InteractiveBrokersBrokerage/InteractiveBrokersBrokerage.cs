@@ -573,7 +573,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             // convert results to Lean Orders outside the eventhandler to avoid nesting requests, as conversion may request
             // contract details
-            return orders.Select(orderContract => ConvertOrders(orderContract.Order, orderContract.Contract, orderContract.OrderState)).SelectMany(orders => orders).ToList();
+            LogScopeNotice();
+            return orders
+                .Select(orderContract => ConvertOrders(orderContract.Order, orderContract.Contract, orderContract.OrderState))
+                .SelectMany(converted => converted)
+                // a resting order of another container would create its Security through
+                // BrokerageSetupHandler.GetOpenOrders -> GetOrAddUnrequestedSecurity
+                .Where(order => !SkipOutOfScope(order.Symbol, "open order"))
+                .ToList();
         }
 
         /// <summary>
@@ -593,28 +600,43 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         public List<Holding> GetAccountHoldingsConnected()
         {
+            LogScopeNotice();
+
             var utcNow = DateTime.UtcNow;
             var holdings = new List<Holding>();
 
             foreach (var kvp in _accountData.AccountHoldings)
             {
                 var holding = ObjectActivator.Clone(kvp.Value);
-
-                if (holding.Quantity != 0)
+                if (holding.Quantity == 0)
                 {
-                    if (OptionSymbol.IsOptionContractExpired(holding.Symbol, utcNow))
-                    {
-                        OnMessage(
-                            new BrokerageMessageEvent(
-                                BrokerageMessageType.Warning,
-                                "ExpiredOptionHolding",
-                                $"The option holding for [{holding.Symbol.Value}] is expired and will be excluded from the account holdings."));
-
-                        continue;
-                    }
-
-                    holdings.Add(holding);
+                    continue;
                 }
+
+                if (SkipOutOfScope(holding.Symbol, "holding"))
+                {
+                    continue;
+                }
+
+                if (OptionSymbol.IsOptionContractExpired(holding.Symbol, utcNow))
+                {
+                    OnMessage(
+                        new BrokerageMessageEvent(
+                            BrokerageMessageType.Warning,
+                            "ExpiredOptionHolding",
+                            $"The option holding for [{holding.Symbol.Value}] is expired and will be excluded from the account holdings."));
+
+                    continue;
+                }
+
+                holdings.Add(holding);
+            }
+
+            if (_tickerScope.Count > 0 && Interlocked.Exchange(ref _scopeHoldingsSummaryLogged, 1) == 0)
+            {
+                Log.Trace($"InteractiveBrokersBrokerage.GetAccountHoldingsConnected(): reporting {holdings.Count} " +
+                          $"position(s) under Ticker=[{TickerScope.Describe(_tickerScope)}]; " +
+                          $"{_scopeSkipsLogged.Count} out-of-scope symbol(s) seen so far.");
             }
 
             return holdings;
@@ -2325,6 +2347,57 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
+        // ── Holding scope ───────────────────────────────────────────────────────────────────────
+        // A live container runs a single underlying (Ticker=NET, see the deploy compose files) while
+        // the IB account is shared by every container. Lean's holdings bootstrap has no override point
+        // (BrokerageSetupHandler.Setup is not virtual and GetOrAddUnrequestedSecurity is a static
+        // extension on IAlgorithm), and every unrequested security it creates is a full Security: the
+        // security initializer runs, a data subscription opens and history is requested. So the filter
+        // lives at the source — this brokerage does not report what the job is not scoped to.
+        // Unset Ticker => no filter (backtests, dev runs and single-underlying setups are unaffected).
+        private static readonly HashSet<string> _tickerScope = TickerScope.FromEnvironment();
+        private readonly ConcurrentDictionary<string, byte> _scopeSkipsLogged = new(StringComparer.OrdinalIgnoreCase);
+        private int _scopeNoticeLogged;
+        private int _scopeHoldingsSummaryLogged;
+
+        /// <summary>
+        /// True when the symbol is outside Ticker; logs once per symbol so the log explains itself
+        /// without a line per portfolio update.
+        /// </summary>
+        private bool SkipOutOfScope(Symbol symbol, string what)
+        {
+            if (_tickerScope.Count == 0 || TickerScope.Contains(_tickerScope, symbol))
+            {
+                return false;
+            }
+
+            if (_scopeSkipsLogged.TryAdd(symbol.Value, 0))
+            {
+                Log.Trace($"InteractiveBrokersBrokerage: {what} {symbol} not reported to Lean — " +
+                          $"underlying is outside Ticker=[{TickerScope.Describe(_tickerScope)}]");
+            }
+            return true;
+        }
+
+        private void LogScopeNotice()
+        {
+            if (Interlocked.Exchange(ref _scopeNoticeLogged, 1) != 0)
+            {
+                return;
+            }
+
+            if (_tickerScope.Count == 0)
+            {
+                Log.Trace("InteractiveBrokersBrokerage: Ticker is not set — reporting the whole IB account " +
+                          "(no holding scope). Set Ticker=NET in the environment to scope this job.");
+            }
+            else
+            {
+                Log.Trace($"InteractiveBrokersBrokerage: holding scope Ticker=[{TickerScope.Describe(_tickerScope)}] — " +
+                          "holdings and open orders of other underlyings are not reported to Lean.");
+            }
+        }
+
         /// <summary>
         /// Handle portfolio changed events from IB
         /// </summary>
@@ -2332,6 +2405,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             try
             {
+                // Scope first: everything below maps the contract, stores a holding and re-emits the whole
+                // holdings list to Lean (which would create a Security for it). Foreign contracts cost
+                // nothing if we drop them here.
+                if (e.Contract == null)
+                {
+                    return;
+                }
+
+                if (!TickerScope.Contains(_tickerScope, e.Contract.Symbol))
+                {
+                    if (_tickerScope.Count > 0 && _scopeSkipsLogged.TryAdd("ib:" + e.Contract.Symbol, 0))
+                    {
+                        Log.Trace($"InteractiveBrokersBrokerage: portfolio update for {e.Contract.Symbol} " +
+                                  $"ignored — outside Ticker=[{TickerScope.Describe(_tickerScope)}].");
+                    }
+                    return;
+                }
+
                 Log.Trace($"InteractiveBrokersBrokerage.HandlePortfolioUpdates(): {e}");
 
                 // notify the transaction handler about all option position updates
@@ -4816,5 +4907,81 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private static readonly TimeSpan _defaultRestartDelay = TimeSpan.FromMinutes(5);
 
         private static TimeSpan _defaultWeeklyRestartUtcTime = GetNextWeekendReconnectionTimeUtc().TimeOfDay;
+    }
+    /// <summary>
+    /// The set of underlyings a live job is scoped to, taken from the Ticker environment variable
+    /// ("NET" or "NET,NOW"). Empty means "no scope" and every caller fails open.
+    /// </summary>
+    internal static class TickerScope
+    {
+        public static HashSet<string> FromEnvironment()
+        {
+            string raw = Environment.GetEnvironmentVariable("Ticker")
+                         ?? Environment.GetEnvironmentVariable("TICKER");
+
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            return raw
+                .Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim())
+                .Where(x => x.Length > 0)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Options are scoped by their underlying; everything else by its own ticker.</summary>
+        public static bool Contains(HashSet<string> scope, Symbol symbol)
+        {
+            if (scope == null || scope.Count == 0)
+            {
+                return true;
+            }
+
+            if (symbol == null)
+            {
+                return false;
+            }
+
+            // Equity options: the contract's underlying carries the ticker ("CRWD" for
+            // "CRWD  261018C00800000"). Canonical option symbols carry it the same way.
+            string ticker;
+            if (symbol.Underlying != null)
+            {
+                ticker = symbol.Underlying.Value;
+            }
+            else if (symbol.SecurityType == SecurityType.Option
+                     || symbol.SecurityType == SecurityType.IndexOption
+                     || symbol.SecurityType == SecurityType.FutureOption)
+            {
+                // Defensive: an option SID without an underlying still has the OSI value, where the
+                // ticker is everything before the first space. Better than silently dropping a
+                // contract that belongs to this job.
+                string value = symbol.Value ?? string.Empty;
+                int space = value.IndexOf(' ');
+                ticker = space > 0 ? value.Substring(0, space) : value;
+            }
+            else
+            {
+                ticker = symbol.Value;
+            }
+
+            return !string.IsNullOrEmpty(ticker) && scope.Contains(ticker);
+        }
+
+        /// <summary>Scope check on a raw IB ticker (option contracts carry the underlying here).</summary>
+        public static bool Contains(HashSet<string> scope, string ibTicker)
+        {
+            if (scope == null || scope.Count == 0)
+            {
+                return true;
+            }
+
+            return !string.IsNullOrEmpty(ibTicker) && scope.Contains(ibTicker.Trim());
+        }
+
+        public static string Describe(HashSet<string> scope) =>
+            scope == null ? string.Empty : string.Join(",", scope.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
     }
 }
