@@ -95,10 +95,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // daily restart is at 23:45 local host time
         private static TimeSpan _heartBeatTimeLimit = new(23, 0, 0);
 
-        // next valid order id (or request id, or ticker id) for this client
+        // ORDER ids only. IB seeds this with `nextValidId`. Request and ticker ids must NOT come out of
+        // it: `nextValidId` counts orders alone, so every time the gateway re-sent it the shared counter
+        // was dragged back below numbers already issued for market data/requests, and the next order
+        // reused an id IB still held -> 103 "Duplicate order id" (NBIS 2026-11-11 20:02:07, id 4405;
+        // the same container log shows the counter moving backwards: 5361 -> 5359).
         private int _nextValidId;
 
+        // Request/ticker ids live in their own space, deliberately far from the order ids so an IB
+        // error carrying a request id can never be routed to an order (HandleError routes by number).
+        private int _nextRequestId = 100_000_000;
+
         private readonly object _nextValidIdLocker = new object();
+
+        // One resubmission per Lean order on a duplicate id: a repeat means our counter is not the
+        // stale side and the order should be invalidated instead.
+        private const int MaxDuplicateOrderIdRetries = 1;
+        private readonly ConcurrentDictionary<int, int> _duplicateOrderIdRetries = new();
 
         private CancellationTokenSource _gatewayRestartTokenSource;
 
@@ -696,7 +709,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             var manualResetEvent = new ManualResetEvent(false);
 
-            var requestId = GetNextId();
+            var requestId = GetNextRequestId();
 
             _requestInformation[requestId] = $"[Id={requestId}] GetExecutions: " + symbol;
 
@@ -827,7 +840,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     if (!_client.Connected) throw new Exception("InteractiveBrokersBrokerage.Connect(): Connection returned but was not in connected state.");
 
                     // request account information for logging purposes
-                    _client.ClientSocket.reqAccountSummary(GetNextId(), "All", "AccountType");
+                    _client.ClientSocket.reqAccountSummary(GetNextRequestId(), "All", "AccountType");
                     _client.ClientSocket.reqManagedAccts();
                     _client.ClientSocket.reqFamilyCodes();
 
@@ -1269,9 +1282,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 lock (_nextValidIdLocker)
                 {
-                    Log.Trace($"InteractiveBrokersBrokerage.HandleNextValidID(): updating nextValidId from {_nextValidId} to {e.OrderId}");
+                    // Never move backwards. IB's nextValidId counts orders only while our counter may
+                    // already be ahead; assigning it unguarded re-issued ids that were still live.
+                    if (e.OrderId > _nextValidId)
+                    {
+                        Log.Trace($"InteractiveBrokersBrokerage.HandleNextValidID(): updating nextValidId from {_nextValidId} to {e.OrderId}");
+                        _nextValidId = e.OrderId;
+                    }
+                    else
+                    {
+                        Log.Trace($"InteractiveBrokersBrokerage.HandleNextValidID(): ignoring nextValidId {e.OrderId}, current is {_nextValidId}");
+                    }
 
-                    _nextValidId = e.OrderId;
                     _waitForNextValidId.Set();
                 }
             };
@@ -1329,8 +1351,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             int ibOrderId;
             if (needsNewId)
             {
-                // the order ids are generated for us by the SecurityTransactionManaer
-                var id = GetNextId();
+                var id = GetNextOrderId();
                 foreach (var newOrder in orders)
                 {
                     newOrder.BrokerId.Add(id.ToStringInvariant());
@@ -1403,6 +1424,65 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 //    eventSlim.DisposeSafely();
                 //}
             }
+        }
+
+        /// <summary>
+        /// IB error 103 "Duplicate order id": the id is stale, the order is not. Clears the id from the
+        /// Lean order(s) and submits once more with a fresh one. Returns false when the order cannot be
+        /// located or its retry budget is spent, in which case the caller falls back to invalidation.
+        /// </summary>
+        private bool TryResubmitDuplicateOrderId(int ibOrderId)
+        {
+            // The original submission will never be acknowledged: unblock anything waiting on that id.
+            if (_pendingOrderResponse.TryRemove(ibOrderId, out var pendingResponse))
+            {
+                pendingResponse.Set();
+            }
+
+            List<Order> orders = _orderProvider.GetOrdersByBrokerageId(ibOrderId);
+            if (orders.IsNullOrEmpty())
+            {
+                Log.Error($"InteractiveBrokersBrokerage.TryResubmitDuplicateOrderId(): unable to locate order with BrokerageID {ibOrderId}");
+                return false;
+            }
+
+            foreach (Order order in orders.Where(order => order != null))
+            {
+                int attempts = _duplicateOrderIdRetries.AddOrUpdate(order.Id, 1, (_, count) => count + 1);
+                if (attempts > MaxDuplicateOrderIdRetries)
+                {
+                    Log.Error($"InteractiveBrokersBrokerage.TryResubmitDuplicateOrderId(): order {order.Id} is still a duplicate after {attempts - 1} resubmission(s) - invalidating");
+                    return false;
+                }
+            }
+
+            foreach (Order order in orders.Where(order => order != null))
+            {
+                order.BrokerId.Clear();
+            }
+
+            // Not on this thread: the IB reader thread is the one delivering this error and it has to
+            // keep pumping, a resubmission can request contract details whose answer arrives through it.
+            Task.Run(() =>
+            {
+                try
+                {
+                    IBPlaceOrder(orders[0], true);
+                    OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, ibOrderId,
+                        $"Duplicate order id {ibOrderId} for {orders[0].Symbol.Value}: resubmitted with a fresh id."));
+                }
+                catch (Exception error)
+                {
+                    Log.Error($"InteractiveBrokersBrokerage.TryResubmitDuplicateOrderId(): resubmission failed for order {orders[0].Id}: {error}");
+                    OnOrderEvents(orders.Where(order => order != null).Select(order => new OrderEvent(order, DateTime.UtcNow, OrderFee.Zero)
+                    {
+                        Status = OrderStatus.Invalid,
+                        Message = $"Duplicate order id {ibOrderId} and the resubmission failed: {error.Message}"
+                    }).ToList());
+                }
+            });
+
+            return true;
         }
 
         private static string GetUniqueKey(Contract contract)
@@ -1495,7 +1575,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             const int timeout = 60; // sec
 
-            var requestId = GetNextId();
+            var requestId = GetNextRequestId();
 
             var contractDetailsList = new List<ContractDetails>();
 
@@ -1602,7 +1682,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             const int timeout = 60; // sec
 
-            var requestId = GetNextId();
+            var requestId = GetNextRequestId();
 
             _requestInformation[requestId] = $"[Id={requestId}] FindContracts: {ticker} ({GetContractDescription(contract)})";
 
@@ -1758,6 +1838,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     Log.Trace($"InteractiveBrokersBrokerage.HandleError(): Not connected, ignoring error, ErrorCode: {errorCode} - {errorMsg}");
                     return;
                 }
+            }
+
+            // 103 is a duplicate order id: the ID is stale, not the order. Clear it and resubmit once
+            // with a fresh one instead of invalidating the order and - 103 being in ErrorCodes -
+            // stopping the whole algorithm with the book left unhedged.
+            if (errorCode == 103 && TryResubmitDuplicateOrderId(requestId))
+            {
+                return;
             }
 
             if (InvalidatingCodes.Contains(errorCode))
@@ -3435,13 +3523,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// Handles the threading issues of creating an IB OrderId/RequestId/TickerId
         /// </summary>
         /// <returns>The new IB OrderId/RequestId/TickerId</returns>
-        private int GetNextId()
+        private int GetNextOrderId()
         {
             lock (_nextValidIdLocker)
             {
                 // return the current value and increment
                 return _nextValidId++;
             }
+        }
+
+        /// <summary>
+        /// Next request/ticker id. Monotonic for the life of the process and never seeded from IB:
+        /// these ids are not orders and must not consume, or be consumed by, the order id sequence.
+        /// </summary>
+        private int GetNextRequestId()
+        {
+            return Interlocked.Increment(ref _nextRequestId);
         }
 
         private void HandleBrokerTime(object sender, IB.CurrentTimeUtcEventArgs e)
@@ -3549,7 +3646,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                 continue;
                             }
 
-                            var id = GetNextId();
+                            var id = GetNextRequestId();
                             var contract = CreateContract(subscribeSymbol, includeExpired: false);
                             var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(subscribeSymbol.ID.Market, subscribeSymbol, subscribeSymbol.SecurityType, Currencies.USD);
                             var priceMagnifier = symbolProperties.PriceMagnifier;
@@ -4276,7 +4373,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     var pacing = false;
                     var dataDownloadedCount = 0;
                     TradeBar oldestDataPoint = null;
-                    var historicalTicker = GetNextId();
+                    var historicalTicker = GetNextRequestId();
 
                     _requestInformation[historicalTicker] = $"[Id={historicalTicker}] GetHistory: {request.Symbol.Value} ({GetContractDescription(contract)})";
 
